@@ -1,0 +1,753 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>贪吃蛇 v0.6 — HackZ 出品 (修复版，速度 & 尸体平均化)</title>
+<style>
+  :root{--bg:#e8f8e6;--panel:rgba(0,0,0,0.6);--accent:#2e8ef7}
+  html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:#222;overflow:hidden}
+  #canvas{display:block;background:var(--bg)}
+  #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;background:linear-gradient(180deg,#f0fff6,#e8f8e6);z-index:60;transition:opacity .9s ease}
+  #splash.hidden{opacity:0;pointer-events:none}
+  .splash-logo{font-weight:900;font-size:64px;letter-spacing:8px;color:#111}
+  #lobby{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:transparent;z-index:50}
+  .logo{font-weight:900;font-size:48px;letter-spacing:6px;color:#111}
+  .subtitle{color:#555;font-size:14px}
+  .menu{display:flex;gap:10px;align-items:center}
+  .btn{padding:12px 18px;border-radius:8px;border:0;background:var(--accent);color:white;font-weight:600;cursor:pointer;font-size:16px}
+  .btn.secondary{background:transparent;border:1px solid rgba(0,0,0,0.08);color:#222}
+  #leaderboard{position:fixed;right:12px;top:12px;background:var(--panel);color:#fff;padding:10px;border-radius:8px;min-width:160px;z-index:20;font-size:13px}
+  #hud{position:fixed;left:12px;bottom:12px;background:var(--panel);color:#fff;padding:8px;border-radius:8px;z-index:20;font-size:13px;min-width:220px}
+  #notice{position:fixed;left:50%;transform:translateX(-50%);top:14px;background:rgba(0,0,0,0.55);color:#fff;padding:8px 12px;border-radius:999px;font-size:13px;z-index:25}
+  #debugErr{position:fixed;right:12px;bottom:12px;background:rgba(255,0,0,0.85);color:#fff;padding:8px;border-radius:6px;font-size:12px;display:none;z-index:100}
+  .progress-bar{background:rgba(255,255,255,0.14);height:8px;border-radius:6px;overflow:hidden;margin-top:6px}
+  .progress-inner{height:100%;border-radius:6px;background:linear-gradient(90deg,var(--accent),#4fb3ff)}
+</style>
+</head>
+<body>
+
+<div id="splash" aria-hidden="false">
+  <div class="splash-logo">HackZ 出品</div>
+  <div style="margin-top:8px;color:#666">贪吃蛇 v0.6 — 本地 Demo（修复版）</div>
+</div>
+
+<div id="lobby" aria-hidden="true">
+  <div class="logo">贪吃蛇 v0.6</div>
+  <div class="subtitle">WASD 控制 · O 复活 · 吃球变长 · AI：2 傻子 / 15 基本 / 13 有点技术 / 10 非常牛（总数 40）</div>
+  <div class="menu">
+    <button id="startBtn" class="btn">开始游戏</button>
+    <button id="skinsBtn" class="btn secondary">选择皮肤（占位）</button>
+    <button id="shopBtn" class="btn secondary">商城（占位）</button>
+  </div>
+  <div style="font-size:13px;color:#444">提示：现在已把“1 格子宽度”映射为 <b>700 段</b>（视觉映射与 HUD 会显示进度）。其它平衡保留。</div>
+</div>
+
+<canvas id="canvas"></canvas>
+<div id="leaderboard" style="display:none"></div>
+<div id="hud" style="display:none"></div>
+<div id="notice" style="display:none"></div>
+<div id="debugErr"></div>
+
+<script>
+// ----------------- 关键可调参数（根据你要求调整） -----------------
+// 把“到某长度才显著变慢”的阈值设为 17000（你要求）
+const SPEED_SLOW_START = 17000;
+// 变慢速率常数（越大减速越厉害）。我把它设置为一个很小的值以保持速度更高。
+// 如果你觉得还是太慢，减小 SLOW_K；如果你想更快降速，增大 SLOW_K。
+const SLOW_K = 0.00007;
+// 限制减速最大生效段数上界（避免计算太大幅度损失）
+// 设得比较大以允许超长蛇逐步变慢（可调）。
+const SLOW_CAP_SEG = 100000;
+// -----------------------------------------------------------------
+
+const MAP_HALF = 4200;
+const BORDER_PADDING = 80;
+const GRID_SIZE = 90;
+
+const ORIGINAL_GROW_SCALE = 7;
+const SIZE_GROW_MULT = 5;
+const SEGMENTS_FOR_ONE_GRID = 700;
+const EFF_PER_GRID = (SEGMENTS_FOR_ONE_GRID * SIZE_GROW_MULT) / ORIGINAL_GROW_SCALE;
+
+const BASE_RADIUS = 10;
+const NUM_AI = 40;
+const INITIAL_BIG_SNAKES = 2;
+const RESPAWN_MS = 10000;
+const PELLET_RADIUS = 6;
+const PELLET_TTL = 60 * 1000;
+const SPAWN_INVUL_MS = 0;
+const MAX_WIDTH_BLOCKS = 10;
+const ORIGINAL_BURST_BASE = 1.35;
+const TOP_BURST_MULTIPLIER = ORIGINAL_BURST_BASE * 12.0;
+const MAX_ABSOLUTE_SPEED = 9.0;
+const INITIAL_SPEED_BOOST = 1.02;
+const MAX_BASE_SPEED_CAP = 5.2;
+const PREFER_ATTACK_OTHERS = 0.62;
+
+// 渲染段上限（性能/精细度权衡），保持不变
+const MAX_RENDER_SEGS = 1200;
+
+let lastBigSpawnAt = 0;
+const BIG_RESPAWN_MIN_INTERVAL = 24000;
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W = window.innerWidth, H = window.innerHeight;
+canvas.width = W; canvas.height = H;
+
+const splash = document.getElementById('splash');
+const lobby = document.getElementById('lobby');
+const startBtn = document.getElementById('startBtn');
+const leaderboardEl = document.getElementById('leaderboard');
+const hud = document.getElementById('hud');
+const notice = document.getElementById('notice');
+const debugErr = document.getElementById('debugErr');
+
+let camX = 0, camY = 0;
+const keys = { w:false,a:false,s:false,d:false,ArrowUp:false,ArrowLeft:false,ArrowDown:false,ArrowRight:false };
+window.addEventListener('keydown', e=>{ if(e.code==='KeyW') keys.w = true; if(e.code==='KeyA') keys.a = true; if(e.code==='KeyS') keys.s = true; if(e.code==='KeyD') keys.d = true; if(e.code==='ArrowUp') keys.ArrowUp = true; if(e.code==='ArrowLeft') keys.ArrowLeft = true; if(e.code==='ArrowDown') keys.ArrowDown = true; if(e.code==='ArrowRight') keys.ArrowRight = true; });
+window.addEventListener('keyup', e=>{ if(e.code==='KeyW') keys.w = false; if(e.code==='KeyA') keys.a = false; if(e.code==='KeyS') keys.s = false; if(e.code==='KeyD') keys.d = false; if(e.code==='ArrowUp') keys.ArrowUp = false; if(e.code==='ArrowLeft') keys.ArrowLeft = false; if(e.code==='ArrowDown') keys.ArrowDown = false; if(e.code==='ArrowRight') keys.ArrowRight = false; });
+
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function lerp(a,b,t){ return a + (b - a) * t; }
+function randomColor(){ return 'hsl(' + Math.floor(Math.random()*360) + ',68%,55%)'; }
+
+function isPointInAnyBody(x,y, padding=0){
+  for(const s of snakes){ if(!s.alive) continue; for(let i=0;i<s.segs.length;i++){ const seg = s.segs[i]; const d = Math.hypot(seg.x - x, seg.y - y); const minDist = Math.max(12, s.visualRadius || BASE_RADIUS) + padding; if(d < minDist) return true; } }
+  return false;
+}
+
+class Snake {
+  constructor(id,x,y,color,isAI=false, params={}){
+    this.id = id;
+    this.head = { x:x, y:y, angle: Math.random()*Math.PI*2 };
+    this.prevHead = { x:x, y:y };
+    this.color = color || randomColor();
+    this.isAI = isAI;
+    this.alive = true;
+    this.segs = [];
+    this.spawnTime = Date.now();
+
+    this.spawnInvulnerableUntil = Date.now() + SPAWN_INVUL_MS;
+
+    this.dodgeSkill = params.dodgeSkill ?? 0.9;
+    this.bodyConsumeProb = params.bodyConsumeProb ?? 0.08;
+    this.aiStrength = (params.aiStrength ?? 1.0) * 0.95;
+    this.thicknessMultiplier = params.thicknessMultiplier ?? 1.0;
+
+    this.isCircler = false;
+    this._initialParams = Object.assign({}, params);
+
+    if(params.segmentCount != null){
+      this.segmentCount = params.segmentCount;
+    } else if(!isAI){
+      this.segmentCount = 18 + Math.floor(Math.random()*12);
+    } else {
+      const r = Math.random();
+      if(r < 0.28) this.segmentCount = 8 + Math.floor(Math.random()*24);
+      else if(r < 0.65) this.segmentCount = 36 + Math.floor(Math.random()*70);
+      else if(r < 0.92) this.segmentCount = 90 + Math.floor(Math.random()*140);
+      else this.segmentCount = 180 + Math.floor(Math.random()*1820);
+    }
+
+    const baseSpeedRaw = (4.2 + Math.random()*0.8) * INITIAL_SPEED_BOOST;
+    const sizeFactor = 1 + Math.log10(Math.max(1, this.segmentCount)) * 0.12 + (this.thicknessMultiplier - 1) * 0.12;
+    this.speedBase = clamp(baseSpeedRaw / sizeFactor, 0.9, MAX_BASE_SPEED_CAP);
+
+    this.displaySpeed = this.speedBase;
+
+    this.score = 0;
+    this.type = params.type || (isAI? 'ai':'player');
+    this.respawnAt = 0;
+    this.burstUntil = 0;
+    if(params.burstMultiplier != null) this.burstMultiplier = params.burstMultiplier;
+    else this.burstMultiplier = 1.15 * this.aiStrength;
+
+    this.visualRadius = BASE_RADIUS;
+    this._physRadius = BASE_RADIUS;
+
+    const initialRendered = Math.min(this.segmentCount, MAX_RENDER_SEGS);
+    for(let i=0;i<initialRendered;i++) this.segs.push({x:this.head.x,y:this.head.y});
+  }
+
+  effectiveCount(){ return Math.max(0, (this.segmentCount * SIZE_GROW_MULT) / ORIGINAL_GROW_SCALE); }
+  computeTargetRadius(){
+    const grids = this.segmentCount / SEGMENTS_FOR_ONE_GRID;
+    const targetRadiusFromGrid = grids * (GRID_SIZE / 2);
+    const target = Math.max(BASE_RADIUS, targetRadiusFromGrid);
+    const maxRadius = (MAX_WIDTH_BLOCKS * GRID_SIZE) / 2;
+    return Math.min(target, maxRadius);
+  }
+  radius(){ return this._physRadius; }
+  segSpacing(){ return Math.max(6, this.visualRadius * 0.78); }
+
+  calcTargetSpeed(){
+    // 调整后的速度逻辑：从 SPEED_SLOW_START 开始才会减速，减速斜率为 SLOW_K，并且 capped 到 SLOW_CAP_SEG
+    let s = Math.max(0.12, this.speedBase);
+    if(this.segmentCount > SPEED_SLOW_START){
+      const capped = Math.min(this.segmentCount, SLOW_CAP_SEG);
+      const extra = (capped - SPEED_SLOW_START);
+      s = Math.max(0.10, this.speedBase - extra * SLOW_K);
+    }
+    if(this.burstUntil && Date.now() < this.burstUntil){
+      s *= this.burstMultiplier;
+    }
+    s = Math.min(s, MAX_ABSOLUTE_SPEED);
+    return s;
+  }
+
+  currentSpeed(){ return this.displaySpeed; }
+
+  updateDisplaySpeed(dt){
+    const target = this.calcTargetSpeed();
+    const smooth = 0.12;
+    this.displaySpeed = lerp(this.displaySpeed, target, smooth);
+  }
+
+  grow(n){
+    this.prevHead.x = this.head.x; this.prevHead.y = this.head.y;
+    this.segmentCount += n;
+    const want = Math.min(this.segmentCount, MAX_RENDER_SEGS);
+    while(this.segs.length < want){
+      const tail = this.segs[this.segs.length-1] || {x:this.head.x,y:this.head.y};
+      this.segs.push({ x: tail.x, y: tail.y });
+    }
+  }
+  shrinkToSmall(){
+    this.segmentCount = 10 + Math.floor(Math.random()*10);
+    const targetRendered = Math.min(this.segmentCount, MAX_RENDER_SEGS);
+    this.segs.length = Math.min(this.segs.length, targetRendered);
+    while(this.segs.length < targetRendered){
+      const tail = this.segs[this.segs.length-1] || {x:this.head.x,y:this.head.y};
+      this.segs.push({ x: tail.x, y: tail.y });
+    }
+    const baseSpeedRaw = (4.2 + Math.random()*0.8) * INITIAL_SPEED_BOOST;
+    this.speedBase = clamp(baseSpeedRaw, 0.9, MAX_BASE_SPEED_CAP);
+    this.displaySpeed = this.speedBase;
+  }
+  updateRadii(dt){
+    const target = this.computeTargetRadius();
+    const visualLerp = 0.045;
+    const physLerp = 0.08;
+    this.visualRadius = lerp(this.visualRadius, target, visualLerp);
+    this._physRadius = lerp(this._physRadius, target, physLerp);
+  }
+}
+
+let pellets = [];
+let snakes = [];
+let playerSnake = null;
+
+function shuffleArray(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+function makeAITiers(){
+  const arr = [];
+  for(let i=0;i<2;i++) arr.push({ tier:'dumb', dodgeSkill:0.56 + Math.random()*0.10, bodyConsumeProb:0.02 + Math.random()*0.03, aiStrength:0.82, thicknessChance:0.08 });
+  for(let i=0;i<15;i++) arr.push({ tier:'basic', dodgeSkill:0.82 + (Math.random()*0.06), bodyConsumeProb:0.03 + Math.random()*0.04, aiStrength:0.96, thicknessChance:0.14 });
+  for(let i=0;i<13;i++) arr.push({ tier:'skilled', dodgeSkill:0.92 + Math.random()*0.04, bodyConsumeProb:0.06 + Math.random()*0.06, aiStrength:1.02, thicknessChance:0.22 });
+  for(let i=0;i<10;i++) arr.push({ tier:'top', dodgeSkill:0.96 + Math.random()*0.02, bodyConsumeProb:0.18 + Math.random()*0.12, aiStrength:1.08, thicknessChance:0.30 });
+  for(let i=0;i<Math.max(1, Math.floor(0.05*(2+15+13+10))); i++) arr.push({ tier:'risky', dodgeSkill:0.65 + Math.random()*0.18, bodyConsumeProb:0.28 + Math.random()*0.3, aiStrength:0.95, thicknessChance:0.12 });
+  return shuffleArray(arr);
+}
+
+function findNearestEnemy(s, range=1400){ let best=null, bestd=Infinity; for(const other of snakes){ if(other===s || !other.alive) continue; const dx = other.head.x - s.head.x, dy = other.head.y - s.head.y; const d = Math.hypot(dx,dy); if(d < bestd && d <= range){ best = other; bestd = d; } } return best; }
+function findNearestPellet(s, range=1400){ let best=null, bestd=Infinity; for(const p of pellets){ const dx = p.x - s.head.x, dy = p.y - s.head.y; const d = Math.hypot(dx,dy); if(d < bestd && d <= range){ best = p; bestd = d; } } return best; }
+
+function pointToSegmentDistance(ax,ay,bx,by,cx,cy){ const vx = bx-ax, vy = by-ay; const wx = cx-ax, wy = cy-ay; const l2 = vx*vx + vy*vy; let t = 0; if(l2 > 0) t = (vx*wx + vy*wy) / l2; t = Math.max(0, Math.min(1, t)); const projx = ax + t * vx, projy = ay + t * vy; const dx = cx - projx, dy = cy - projy; return Math.hypot(dx,dy); }
+
+function aiThink(s){
+  if(!s.alive) return;
+  const now = Date.now();
+  if(s.isCircler){ if(Math.random() < 0.035) s.head.angle += (Math.random()-0.5)*1.1; }
+
+  const isBig = (s.type==='big' || s.segmentCount > 900 || (s._initialParams && s._initialParams.type === 'big'));
+
+  let nearestThreat = null, threatD = Infinity;
+  for(const other of snakes){ if(other===s || !other.alive) continue; if(other.segmentCount > s.segmentCount * 0.9 && other.segmentCount > Math.max(200, s.segmentCount - 10)){ const d = Math.hypot(other.head.x - s.head.x, other.head.y - s.head.y); if(d < threatD){ threatD = d; nearestThreat = other; } } }
+  if(nearestThreat && threatD < 900){ const away = Math.atan2(s.head.y - nearestThreat.head.y, s.head.x - nearestThreat.head.x); s.head.angle = lerpAngle(s.head.angle, away + (Math.random()-0.5)*0.2, 0.25); if(Math.random() < 0.4) s.burstUntil = now + 300; return; }
+
+  const pellet = findNearestPellet(s, isBig ? 2000 : 1400);
+  if(pellet && Math.random() < (isBig ? 0.9 : 0.6)){
+    s.head.angle = lerpAngle(s.head.angle, Math.atan2(pellet.y - s.head.y, pellet.x - s.head.x), 0.14);
+    if(Math.random() < 0.06 * s.aiStrength) s.burstUntil = now + 220;
+    return;
+  }
+
+  let nearestBody = null, nearestBodyD = Infinity;
+  for(const other of snakes){ if(!other.alive) continue; const startIdx = 4; for(let i=startIdx;i<other.segs.length;i+= Math.max(1, Math.floor(other.segs.length / 30))){ const seg = other.segs[i]; const d = Math.hypot(seg.x - s.head.x, seg.y - s.head.y); if(d < nearestBodyD){ nearestBodyD = d; nearestBody = {x:seg.x,y:seg.y,owner:other}; } } }
+
+  const avoidThreshold = 150 + s.visualRadius * 5;
+  if(nearestBody && nearestBodyD < avoidThreshold){
+    if(Math.random() < s.dodgeSkill){
+      const awayAng = Math.atan2(s.head.y - nearestBody.y, s.head.x - nearestBody.x);
+      s.head.angle = lerpAngle(s.head.angle, awayAng + (Math.sin(now/320)*0.6), 0.18);
+      if(Math.random() < 0.06 * s.aiStrength) s.burstUntil = now + 160 + Math.random()*280;
+      return;
+    } else {
+      if(Math.random() < s.bodyConsumeProb){
+        s.head.angle = lerpAngle(s.head.angle, Math.atan2(nearestBody.y - s.head.y, nearestBody.x - s.head.x), 0.15);
+        if(Math.random() < 0.3) s.burstUntil = now + 180;
+        return;
+      }
+    }
+  }
+
+  const player = playerSnake;
+  const distToPlayer = player && player.alive ? Math.hypot(player.head.x - s.head.x, player.head.y - s.head.y) : Infinity;
+  let choosePlayer = false;
+  if(player && player.alive && distToPlayer < 2000){ choosePlayer = Math.random() < (isBig ? 0.38 : (1 - PREFER_ATTACK_OTHERS)); }
+
+  if(!choosePlayer){
+    const near = findNearestEnemy(s, isBig ? 2000 : 1600);
+    if(near){
+      const dx = near.head.x - s.head.x, dy = near.head.y - s.head.y; const d = Math.hypot(dx,dy);
+      const targ = Math.atan2(dy,dx);
+      if(d < 520 && Math.abs(s.segmentCount - near.segmentCount) < 40){
+        const offset = (Math.random() < 0.5 ? 0.4 : -0.4);
+        s.head.angle = lerpAngle(s.head.angle, targ + offset, 0.15);
+        if(Math.random() < 0.10 * s.aiStrength) s.burstUntil = now + 240;
+      } else {
+        s.head.angle = lerpAngle(s.head.angle, targ, 0.11 + Math.random()*0.05);
+        if(d < 360 && s.segmentCount > near.segmentCount + 8 && Math.random() < 0.2) s.burstUntil = now + 300;
+      }
+      return;
+    }
+  }
+
+  if(player && player.alive && Math.random() < 0.55){
+    s.head.angle = lerpAngle(s.head.angle, Math.atan2(player.head.y - s.head.y, player.head.x - s.head.x), 0.10);
+    if(Math.random() < 0.014 * s.aiStrength) s.burstUntil = now + 200;
+  } else { s.head.angle += (Math.random()-0.5)*0.016; }
+}
+
+function lerpAngle(a,b,t){ let diff=b-a; while(diff>Math.PI) diff-=Math.PI*2; while(diff<-Math.PI) diff+=Math.PI*2; return a+diff*t; }
+
+function updateSnakeMovement(s, dt){
+  if(!s.alive) return;
+  s.prevHead.x = s.head.x; s.prevHead.y = s.head.y;
+  if(!s.isAI){
+    let vx=0, vy=0;
+    if(keys.w || keys.ArrowUp) vy -= 1;
+    if(keys.s || keys.ArrowDown) vy += 1;
+    if(keys.a || keys.ArrowLeft) vx -= 1;
+    if(keys.d || keys.ArrowRight) vx += 1;
+    if(vx!==0 || vy!==0) s.head.angle = Math.atan2(vy, vx);
+  } else aiThink(s);
+
+  s.updateDisplaySpeed(dt);
+  const speed = s.currentSpeed();
+
+  s.head.x += Math.cos(s.head.angle) * speed * dt;
+  s.head.y += Math.sin(s.head.angle) * speed * dt;
+
+  const maxCoord = MAP_HALF - BORDER_PADDING;
+  s.head.x = Math.max(-maxCoord, Math.min(maxCoord, s.head.x));
+  s.head.y = Math.max(-maxCoord, Math.min(maxCoord, s.head.y));
+
+  for(const other of snakes){
+    if(other === s || !other.alive) continue;
+    for(let k=4;k<other.segs.length;k+=Math.max(1, Math.floor(other.segs.length/40))){
+      const seg = other.segs[k];
+      const d = Math.hypot(s.head.x - seg.x, s.head.y - seg.y);
+      const minDist = Math.max(6, other.visualRadius * 0.6);
+      if(d < minDist){
+        s.head.x = s.prevHead.x; s.head.y = s.prevHead.y;
+        const away = Math.atan2(s.head.y - seg.y, s.head.x - seg.x);
+        s.head.angle = lerpAngle(s.head.angle, away, 0.8);
+        s.displaySpeed *= 0.45;
+        k = other.segs.length + 999;
+      }
+    }
+  }
+
+  if(!Array.isArray(s.segs)) s.segs = [];
+  if(s.segs.length === 0) s.segs.push({ x:s.head.x, y:s.head.y });
+
+  const targetRendered = Math.min(s.segmentCount, MAX_RENDER_SEGS);
+  s.segs[0] = { x: s.head.x, y: s.head.y };
+
+  const spacingMultiplier = Math.max(1, s.segmentCount / Math.max(1, targetRendered));
+  const baseTarget = s.segSpacing();
+  const target = baseTarget * spacingMultiplier;
+
+  while(s.segs.length < targetRendered) {
+    const tail = s.segs[s.segs.length-1] || {x:s.head.x,y:s.head.y};
+    s.segs.push({ x: tail.x, y: tail.y });
+  }
+  if(s.segs.length > targetRendered) s.segs.length = targetRendered;
+
+  for(let i=1;i<s.segs.length;i++){
+    const prev = s.segs[i-1], cur = s.segs[i];
+    const dx = prev.x - cur.x, dy = prev.y - cur.y;
+    const dist = Math.hypot(dx,dy) || 0.0001;
+    const nx = prev.x - (dx/dist)*target;
+    const ny = prev.y - (dy/dist)*target;
+    cur.x = cur.x + (nx - cur.x) * 0.92;
+    cur.y = cur.y + (ny - cur.y) * 0.92;
+  }
+
+  s.updateRadii(dt);
+}
+
+function updatePelletPickup(){
+  if(pellets.length===0) return;
+  for(let pi = pellets.length-1; pi>=0; pi--){
+    const p = pellets[pi];
+    for(const s of snakes){
+      if(!s.alive) continue;
+      const rad = s.visualRadius;
+      const dx = s.head.x - p.x, dy = s.head.y - p.y;
+      const d = Math.hypot(dx,dy);
+      if(d < rad + PELLET_RADIUS*0.8){
+        const val = p.value ?? 1.0;
+        s.growthBuffer = (s.growthBuffer || 0) + val;
+        while(s.growthBuffer >= 1.0){ s.growthBuffer -= 1.0; s.grow(1); }
+        pellets.splice(pi,1);
+        break;
+      }
+    }
+  }
+  const now = Date.now();
+  for(let i=pellets.length-1;i>=0;i--) if(now - pellets[i].created > PELLET_TTL) pellets.splice(i,1);
+}
+
+// ---------- 平均化尸体：沿渲染路径的弧长均匀采样（不依赖巨大逻辑数组） ----------
+function createPelletsFromVictim(victim){
+  // 使用 victim.segs（渲染段，长度 <= MAX_RENDER_SEGS）计算路径的累计弧长
+  const positions = (victim.segs && victim.segs.slice(0)) || [];
+  if(!positions || positions.length < 2) return;
+
+  // desiredGain 根据逻辑段数决定（玩家应该从大蛇获得较多资源）
+  const desiredGain = Math.max(1, Math.floor((victim.segmentCount * 2) / 3));
+  const MAX_PELLETS = 200;
+  const N = Math.min(MAX_PELLETS, Math.max(10, Math.min(desiredGain, 200)));
+
+  // 计算累积弧长
+  const cum = [0];
+  let total = 0;
+  for(let i=1;i<positions.length;i++){
+    const dx = positions[i].x - positions[i-1].x, dy = positions[i].y - positions[i-1].y;
+    const d = Math.hypot(dx,dy);
+    total += d;
+    cum.push(total);
+  }
+  if(total <= 0){
+    // 如果渲染段都重合，退化为均匀分布在头部附近
+    for(let i=0;i<N;i++){
+      const angle = Math.random()*Math.PI*2;
+      const r = 12 + Math.random()*Math.min(200, victim.visualRadius*1.2);
+      const x = victim.head.x + Math.cos(angle)*r;
+      const y = victim.head.y + Math.sin(angle)*r;
+      const val = desiredGain / N;
+      pellets.push({ x, y, color: victim.color, created: Date.now(), value: val });
+    }
+    return;
+  }
+
+  // 按弧长等分 N 段，采样位置并插值
+  for(let i=0;i<N;i++){
+    const t = (i + 0.5) / N; // 中点采样
+    const targetLen = t * total;
+    // 二分或线性扫描找到 segment
+    let idx = 0;
+    while(idx < cum.length - 1 && cum[idx+1] < targetLen) idx++;
+    const segStartLen = cum[idx];
+    const segEndLen = cum[idx+1] || segStartLen;
+    const segLen = segEndLen - segStartLen;
+    let frac = 0;
+    if(segLen > 0) frac = (targetLen - segStartLen) / segLen;
+    const p0 = positions[idx], p1 = positions[Math.min(idx+1, positions.length-1)];
+    const x = p0.x * (1-frac) + p1.x * frac;
+    const y = p0.y * (1-frac) + p1.y * frac;
+    const val = desiredGain / N;
+    pellets.push({ x: x, y: y, color: victim.color, created: Date.now(), value: val });
+  }
+}
+
+// ---------------- 剩余游戏逻辑（碰撞/复活/渲染等） ----------------
+function killSnake(victim, killer, reason){
+  if(!victim.alive) return;
+  const now = Date.now();
+  if((victim.spawnInvulnerableUntil && now < victim.spawnInvulnerableUntil) || (killer && killer.spawnInvulnerableUntil && now < killer.spawnInvulnerableUntil)){
+    return;
+  }
+  if(now - (victim.spawnTime || 0) < 100) return;
+  victim.alive = false;
+  victim.respawnAt = Date.now() + RESPAWN_MS;
+  createPelletsFromVictim(victim);
+
+  if(killer && killer.alive){
+    const rawGain = 4 + Math.floor(Math.random()*6);
+    const gain = Math.max(1, Math.floor(rawGain / 2));
+    killer.prevHead.x = killer.head.x; killer.prevHead.y = killer.head.y;
+    killer.grow(gain);
+    killer.score = (killer.score || 0) + 1;
+    const kname = (killer === playerSnake ? '你' : killer.id);
+    const vname = (victim === playerSnake ? '你' : victim.id);
+    showNotice(kname + ' 击杀 ' + vname + ' +' + gain);
+  } else {
+    const vname = (victim === playerSnake ? '你' : victim.id);
+    showNotice(vname + ' 因 ' + (reason || '原因') + ' 死亡');
+  }
+}
+
+function checkCollisions(){
+  const b = MAP_HALF - BORDER_PADDING;
+  const now = Date.now();
+  for(const s of snakes){ if(!s.alive) continue; if(Math.abs(s.head.x) > b || Math.abs(s.head.y) > b){ killSnake(s, null, '边界'); } }
+
+  for(let i=0;i<snakes.length;i++){
+    const A = snakes[i];
+    if(!A.alive) continue;
+    const ax0 = (A.prevHead && A.prevHead.x) || A.head.x;
+    const ay0 = (A.prevHead && A.prevHead.y) || A.head.y;
+    const ax1 = A.head.x, ay1 = A.head.y;
+    const radAvis = A.visualRadius;
+
+    for(let j=0;j<snakes.length;j++){
+      if(i===j) continue;
+      const B = snakes[j];
+      if(!B.alive) continue;
+      const radBvis = B.visualRadius;
+
+      if((A.spawnInvulnerableUntil && now < A.spawnInvulnerableUntil) || (B.spawnInvulnerableUntil && now < B.spawnInvulnerableUntil)) continue;
+
+      if(i < j){
+        const dxHH = A.head.x - B.head.x, dyHH = A.head.y - B.head.y;
+        const dHH = Math.hypot(dxHH,dyHH);
+        if(dHH < (radAvis + radBvis) * 0.95){
+          const dist = Math.max(0.0001, dHH);
+          const nx = (B.head.x - A.head.x)/dist, ny = (B.head.y - A.head.y)/dist;
+          const vAx = Math.cos(A.head.angle) * A.currentSpeed();
+          const vAy = Math.sin(A.head.angle) * A.currentSpeed();
+          const vBx = Math.cos(B.head.angle) * B.currentSpeed();
+          const vBy = Math.sin(B.head.angle) * B.currentSpeed();
+          const projA = vAx * nx + vAy * ny;
+          const projB = -(vBx * nx + vBy * ny);
+          const EPS = 0.14;
+          if(projA > projB + EPS){ killSnake(B, A, '头碰头'); }
+          else if(projB > projA + EPS){ killSnake(A, B, '头碰头'); }
+          else {
+            if((A === playerSnake && B.isAI) && (Math.random() < 0.9)) killSnake(B, A, '头碰头(玩家优先)');
+            else if((B === playerSnake && A.isAI) && (Math.random() < 0.9)) killSnake(A, B, '头碰头(玩家优先)');
+            else { if(Math.random() < 0.5) killSnake(A, B, '头碰头(随机)'); else killSnake(B, A, '头碰头(随机)'); }
+          }
+          continue;
+        }
+      }
+
+      // 玩家身体 vs 对方头 -> 直接圆相交即死（即时）
+      if(A === playerSnake && B.alive){
+        const segRad = Math.max(6, A.visualRadius);
+        const headRad = radBvis;
+        for(let si = 1; si < A.segs.length; si++){
+          const seg = A.segs[si];
+          const d = Math.hypot(seg.x - B.head.x, seg.y - B.head.y);
+          if(d < segRad + headRad && !(B.spawnInvulnerableUntil && Date.now() < B.spawnInvulnerableUntil)){
+            killSnake(B, A, '被玩家身体触碰头部');
+            break;
+          }
+        }
+        if(!B.alive) continue;
+      }
+      if(B === playerSnake && A.alive){
+        const segRad = Math.max(6, B.visualRadius);
+        const headRad = radAvis;
+        for(let si = 1; si < B.segs.length; si++){
+          const seg = B.segs[si];
+          const d = Math.hypot(seg.x - A.head.x, seg.y - A.head.y);
+          if(d < segRad + headRad && !(A.spawnInvulnerableUntil && Date.now() < A.spawnInvulnerableUntil)){
+            killSnake(A, B, '被玩家身体触碰头部');
+            break;
+          }
+        }
+        if(!A.alive) continue;
+      }
+
+      let skip = Math.max(1, Math.floor(B.segs.length / 120));
+      const minSkip = 1; if(skip < minSkip) skip = minSkip;
+
+      for(let k=4;k<B.segs.length;k+= skip){
+        const seg = B.segs[k];
+        const dseg = pointToSegmentDistance(ax0,ay0,ax1,ay1, seg.x, seg.y);
+        const threshold = Math.max(6, (radAvis + radBvis) * 0.62);
+        if(dseg < threshold && !(Date.now() - (B.spawnTime || 0) < SPAWN_INVUL_MS)){
+          if(B === playerSnake){
+            // 保护玩家
+          } else if(A.segmentCount > 300 && B.segmentCount < Math.max(8, A.segmentCount * 0.25) && B !== playerSnake){
+            killSnake(B, A, '被巨大蛇碾压');
+          } else {
+            killSnake(A, B, '穿透/撞到身体');
+          }
+          break;
+        }
+      }
+      if(!A.alive) break;
+    }
+  }
+}
+
+function tryFindSafeSpawn(strict=false){
+  const padding = Math.max(80, GRID_SIZE);
+  for(let attempt=0;attempt<40;attempt++){
+    const x = (Math.random()*2-1) * (MAP_HALF - 700);
+    const y = (Math.random()*2-1) * (MAP_HALF - 700);
+    if(!isPointInAnyBody(x,y, padding)) return {x,y};
+  }
+  if(strict) return null;
+  return { x: (Math.random()*2-1) * (MAP_HALF - 700), y: (Math.random()*2-1) * (MAP_HALF - 700) };
+}
+
+function handleRespawns(){
+  const now = Date.now();
+  for(const s of snakes){
+    if(!s.alive && s.respawnAt && now >= s.respawnAt){
+      const pos = tryFindSafeSpawn(true);
+      if(!pos){
+        s.respawnAt = Date.now() + 1500 + Math.floor(Math.random()*800);
+        continue;
+      }
+
+      s.alive = true;
+      s.head.x = pos.x;
+      s.head.y = pos.y;
+      s.head.angle = Math.random()*Math.PI*2;
+      s.segs = [];
+
+      s.spawnInvulnerableUntil = Date.now() + SPAWN_INVUL_MS;
+
+      if(s._initialParams && s._initialParams.segmentCount && (s._initialParams.type === 'big' || s.type === 'big')){
+        const segCount = 900 + Math.floor(Math.random()*1600);
+        s.segmentCount = segCount;
+        s.thicknessMultiplier = s._initialParams.thicknessMultiplier || (2.0 + Math.random()*2.0);
+        s.speedBase = Math.max(0.5, (4.2 + Math.random()*0.6) * 0.6);
+        s.burstMultiplier = TOP_BURST_MULTIPLIER;
+        s.type = 'big';
+        s.dodgeSkill = Math.min(0.99, (s.dodgeSkill || 0.75) + 0.18);
+        s.aiStrength = (s.aiStrength || 0.9) + 0.18;
+        s.bodyConsumeProb = Math.max(0.36, s.bodyConsumeProb || 0.28);
+      } else {
+        s.shrinkToSmall();
+      }
+
+      const fill = Math.min(s.segmentCount, MAX_RENDER_SEGS);
+      for(let i=0;i<fill;i++) s.segs.push({x:s.head.x,y:s.head.y});
+      s.respawnAt = 0;
+      s.spawnTime = Date.now();
+      s.score = 0;
+      showNotice((s === playerSnake ? '你' : s.id) + ' 已复活');
+    }
+  }
+}
+
+function worldToScreen(wx, wy){ return { x: Math.round((wx - camX) + W/2), y: Math.round((wy - camY) + H/2) }; }
+function colorWithAlpha(hsl,a){ return hsl.replace('hsl(', 'hsla(').replace(')', ', ' + a + ')'); }
+let noticeTimer = 0;
+function showNotice(txt){ notice.innerText = txt; notice.style.display = 'block'; noticeTimer = Date.now() + 1600; }
+
+function drawMap(){ ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg') || '#e8f8e6'; ctx.fillRect(0,0,W,H); ctx.strokeStyle = 'rgba(140,190,160,0.6)'; ctx.lineWidth = 1; const left = camX - W/2 - GRID_SIZE, top = camY - H/2 - GRID_SIZE; const right = camX + W/2 + GRID_SIZE, bottom = camY + H/2 + GRID_SIZE; const startX = Math.floor(left / GRID_SIZE) * GRID_SIZE, startY = Math.floor(top / GRID_SIZE) * GRID_SIZE; ctx.beginPath(); for(let gx = startX; gx <= right; gx += GRID_SIZE){ const s = worldToScreen(gx, camY); ctx.moveTo(s.x, 0); ctx.lineTo(s.x, H); } for(let gy = startY; gy <= bottom; gy += GRID_SIZE){ const s = worldToScreen(camX, gy); ctx.moveTo(0, s.y); ctx.lineTo(W, s.y); } ctx.stroke(); const leftWorld = -MAP_HALF + BORDER_PADDING, topWorld = -MAP_HALF + BORDER_PADDING; const rightWorld = MAP_HALF - BORDER_PADDING, bottomWorld = MAP_HALF - BORDER_PADDING; const p1 = worldToScreen(leftWorld, topWorld), p2 = worldToScreen(rightWorld, bottomWorld); ctx.strokeStyle = 'rgba(255,60,60,0.98)'; ctx.lineWidth = 6; ctx.strokeRect(p1.x, p1.y, p2.x - p1.x, p2.y - p1.y); }
+function drawPellets(){ for(const p of pellets){ const pos = worldToScreen(p.x, p.y); ctx.beginPath(); ctx.fillStyle = p.color; ctx.arc(pos.x, pos.y, PELLET_RADIUS, 0, Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.arc(pos.x - 2, pos.y - 2, Math.max(1, PELLET_RADIUS*0.28), 0, Math.PI*2); ctx.fill(); } }
+function drawSnakes(){ for(const s of snakes){ if(!s.alive) continue; const rad = s.visualRadius; for(let i = s.segs.length - 1; i >= 0; i--){ const seg = s.segs[i]; const pos = worldToScreen(seg.x, seg.y); const alpha = 0.95 - (i / s.segs.length) * 0.5; ctx.fillStyle = colorWithAlpha(s.color, alpha); ctx.beginPath(); ctx.arc(pos.x, pos.y, rad, 0, Math.PI*2); ctx.fill(); } const headPos = worldToScreen(s.head.x, s.head.y); ctx.beginPath(); ctx.fillStyle = '#fff'; ctx.arc(headPos.x, headPos.y, Math.max(4, rad * 0.36), 0, Math.PI*2); ctx.fill(); const eyeOffset = rad * 0.46; const ex = headPos.x + Math.cos(s.head.angle) * eyeOffset, ey = headPos.y + Math.sin(s.head.angle) * eyeOffset; ctx.beginPath(); ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.arc(ex, ey, Math.max(2, rad*0.18), 0, Math.PI*2); ctx.fill(); ctx.font = '12px sans-serif'; ctx.fillStyle = '#111'; ctx.textAlign = 'center'; ctx.fillText(Math.floor(s.segmentCount), headPos.x, headPos.y - rad - 8); } }
+
+function updateHUD(){ if(!playerSnake) return; const segs = Math.floor(playerSnake.segmentCount); const phys = Math.round(playerSnake._physRadius); const vis = Math.round(playerSnake.visualRadius); const spd = playerSnake.currentSpeed().toFixed(2); const eff = playerSnake.effectiveCount(); const pct = Math.round(clamp((eff / EFF_PER_GRID) * 100, 0, 100)); const progressBar = '<div class="progress-bar"><div class="progress-inner" style="width:'+pct+'%"></div></div>'; hud.innerHTML = '段数 (逻辑/渲染): <b>'+segs+'</b> / <b>'+playerSnake.segs.length+'</b> &nbsp; 物理半径: <b>'+phys+'</b> &nbsp; 视觉半径: <b>'+vis+'</b> &nbsp; 速度: <b>'+spd+'</b><br> 到 1 格进度: <b>'+pct+'%</b> （'+Math.min(segs, SEGMENTS_FOR_ONE_GRID)+'/'+SEGMENTS_FOR_ONE_GRID+' 段）' + progressBar; }
+
+function updateLeaderboard(){ const arr = snakes.slice().filter(s=>s.alive).sort((a,b)=>b.segmentCount - a.segmentCount); let html = '<b>排行榜 Top 5</b><br>'; for(let i=0;i<5;i++){ const s = arr[i]; if(!s) break; const name = s === playerSnake ? '你' : s.id; html += (i+1) + '. ' + name + ' — ' + Math.floor(s.segmentCount) + '<br>'; } leaderboardEl.innerHTML = html; }
+
+let lastTime = performance.now(), running = false;
+function mainLoop(now){ if(!running) return; try { const dtRaw = now - lastTime; lastTime = now; const dt = Math.min(2.0, dtRaw / 16.666); for(const s of snakes){ if(s.alive) updateSnakeMovement(s, dt); } checkCollisions(); updatePelletPickup(); handleRespawns(); if(playerSnake){ camX += (playerSnake.head.x - camX) * 0.14; camY += (playerSnake.head.y - camY) * 0.14; } drawMap(); drawPellets(); drawSnakes(); updateLeaderboard(); updateHUD(); if(noticeTimer && Date.now() > noticeTimer){ notice.style.display = 'none'; noticeTimer = 0; } debugErr.style.display = 'none'; } catch (err){ console.error('主循环出错：', err); debugErr.style.display = 'block'; debugErr.innerText = '发生错误（控制台可见），继续运行…'; } requestAnimationFrame(mainLoop); }
+
+function initGame(){
+  snakes = []; pellets = [];
+  playerSnake = new Snake('你', 0, 0, '#2e8ef7', false);
+  snakes.push(playerSnake);
+
+  const weightedCounts = [0,1,2,3,4];
+  const probs = [0.20,0.40,0.30,0.07,0.03];
+  function weightedSample(arr, ps){ const r=Math.random(); let acc=0; for(let i=0;i<arr.length;i++){ acc+=ps[i]; if(r<=acc) return arr[i]; } return arr[arr.length-1]; }
+  const veryBigCount = weightedSample(weightedCounts, probs);
+  const maxVeryBig = Math.min(INITIAL_BIG_SNAKES, veryBigCount);
+
+  for(let i=0;i<maxVeryBig;i++){
+    const pos = tryFindSafeSpawn();
+    const x = pos.x, y = pos.y;
+    const segCount = 1001 + Math.floor(Math.random()*1200);
+    const thickness = 2.0 + Math.random() * 3.5;
+    const intelRand = Math.random();
+    const intelligenceLevel = intelRand < 0.65 ? 2 : (intelRand < 0.95 ? 3 : 4);
+    const params = { type:'big', dodgeSkill: (intelligenceLevel===2?0.68:(intelligenceLevel===3?0.78:0.86)), bodyConsumeProb:0.25 + Math.random()*0.3, aiStrength:0.88 + Math.random()*0.2, thicknessMultiplier:thickness, segmentCount:segCount };
+    const s = new Snake('VERY'+(i+1), x, y, randomColor(), true, params);
+    s.speedBase = Math.max(0.5, s.speedBase * 0.7);
+    s.burstMultiplier = TOP_BURST_MULTIPLIER;
+    s.intelligenceLevel = intelligenceLevel;
+    s.dodgeSkill = Math.min(0.99, (s.dodgeSkill || params.dodgeSkill || 0.7) + 0.18);
+    s.aiStrength = (s.aiStrength || params.aiStrength || 0.95) + 0.18;
+    s.bodyConsumeProb = Math.max(0.32, s.bodyConsumeProb || params.bodyConsumeProb || 0.28);
+    s.burstMultiplier = (s.burstMultiplier || TOP_BURST_MULTIPLIER) * 1.08;
+    snakes.push(s);
+  }
+
+  const tierParams = makeAITiers();
+  let idx = 0;
+  for(let i=0;i<NUM_AI - maxVeryBig;i++){
+    const p = tierParams[idx++] || tierParams[idx % tierParams.length];
+    const pos = tryFindSafeSpawn();
+    const x = pos.x, y = pos.y;
+    let thickness = 1.0;
+    if(Math.random() < p.thicknessChance){ thickness = 1.2 + Math.random() * 1.6; }
+    const paramsForSnake = { type: p.tier === 'basic' ? 'basic' : (p.tier === 'skilled' ? 'skilled' : (p.tier === 'top' ? 'top' : 'dumb')), dodgeSkill: p.dodgeSkill, bodyConsumeProb: p.bodyConsumeProb, aiStrength: p.aiStrength, thicknessMultiplier: thickness };
+    if(p.tier === 'top'){ paramsForSnake.burstMultiplier = TOP_BURST_MULTIPLIER; }
+    if(Math.random() < 0.14 && p.tier !== 'dumb'){ paramsForSnake.segmentCount = 200 + Math.floor(Math.random()*1200); }
+    const playerInitLen = playerSnake.segmentCount || 18;
+    if(paramsForSnake.segmentCount && paramsForSnake.segmentCount < Math.max(6, playerInitLen - 2)){ paramsForSnake.segmentCount = Math.max(6, playerInitLen - 2); }
+    const s = new Snake('AI'+(i+1), x, y, randomColor(), true, paramsForSnake);
+    if(s.segmentCount < Math.max(6, playerInitLen - 2)) s.segmentCount = Math.max(6, playerInitLen - 2);
+    snakes.push(s);
+  }
+
+  const candidateCirclers = snakes.filter(s=>s.isAI && (s.type==='dumb' || s.type==='basic'));
+  shuffleArray(candidateCirclers);
+  const maxCirclers = 2;
+  for(let i=0;i<Math.min(maxCirclers, candidateCirclers.length); i++){ candidateCirclers[i].isCircler = true; }
+
+  leaderboardEl.style.display = 'block'; hud.style.display = 'block'; notice.style.display = 'none';
+  camX = playerSnake.head.x; camY = playerSnake.head.y;
+  showNotice('游戏准备就绪，开始吧！');
+}
+
+function showSplashThenLobby(){ splash.style.display = 'flex'; lobby.style.display = 'none'; setTimeout(()=>{ splash.classList.add('hidden'); setTimeout(()=>{ splash.style.display='none'; lobby.style.display='flex'; }, 900); }, 1400); }
+
+startBtn.addEventListener('click', ()=>{ lobby.style.display = 'none'; canvas.style.display = 'block'; canvas.width = window.innerWidth; canvas.height = window.innerHeight; W = canvas.width; H = canvas.height; initGame(); running = true; lastTime = performance.now(); requestAnimationFrame(mainLoop); });
+window.addEventListener('resize', ()=>{ canvas.width = window.innerWidth; canvas.height = window.innerHeight; W = canvas.width; H = canvas.height; });
+window.addEventListener('keydown', e=>{ if(e.key==='o' || e.key==='O'){ if(playerSnake && !playerSnake.alive){ playerSnake.respawnAt = Date.now(); playerSnake.spawnTime = Date.now(); playerSnake.spawnInvulnerableUntil = Date.now() + SPAWN_INVUL_MS; } } });
+window.addEventListener('keydown', e=>{ if(e.key==='r' || e.key==='R'){ if(playerSnake && !playerSnake.alive){ playerSnake.respawnAt = Date.now(); playerSnake.spawnTime = Date.now(); playerSnake.spawnInvulnerableUntil = Date.now() + SPAWN_INVUL_MS; } } });
+
+canvas.width = W; canvas.height = H;
+leaderboardEl.style.display = 'none'; hud.style.display = 'none';
+showSplashThenLobby();
+</script>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
